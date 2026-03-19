@@ -464,12 +464,13 @@ impl LocalBufferStore {
         cx: &mut Context<BufferStore>,
     ) {
         let snapshot = worktree_handle.read(cx).snapshot();
-        for (path, entry_id, _) in changes {
+        for (path, entry_id, path_change) in changes {
             Self::local_worktree_entry_changed(
                 this,
                 *entry_id,
                 path,
                 worktree_handle,
+                *path_change,
                 &snapshot,
                 cx,
             );
@@ -481,6 +482,7 @@ impl LocalBufferStore {
         entry_id: ProjectEntryId,
         path: &Arc<RelPath>,
         worktree: &Entity<worktree::Worktree>,
+        path_change: PathChange,
         snapshot: &worktree::Snapshot,
         cx: &mut Context<BufferStore>,
     ) -> Option<()> {
@@ -550,7 +552,12 @@ impl LocalBufferStore {
                 }
             };
 
-            if new_file == *old_file {
+            let force_reload_needed_for_updated_path = matches!(
+                path_change,
+                PathChange::Updated | PathChange::AddedOrUpdated
+            ) && new_file == *old_file;
+
+            if !force_reload_needed_for_updated_path && new_file == *old_file {
                 return None;
             }
 
@@ -594,7 +601,15 @@ impl LocalBufferStore {
                     .ok();
             }
 
+            let new_file_disk_state = new_file.disk_state;
             buffer.file_updated(Arc::new(new_file), cx);
+            if force_reload_needed_for_updated_path
+                && !buffer.is_dirty()
+                && matches!(new_file_disk_state, DiskState::Present { .. })
+            {
+                cx.emit(BufferEvent::ReloadNeeded);
+                cx.notify();
+            }
             Some(events)
         })?;
 
@@ -1145,6 +1160,14 @@ impl BufferStore {
         cx: &mut Context<Self>,
     ) {
         match event {
+            BufferEvent::ReloadNeeded => {
+                if let Some((downstream_client, _)) = self.downstream_client.as_ref()
+                    && !downstream_client.is_via_collab()
+                {
+                    self.reload_buffers([buffer.clone()].into_iter().collect(), true, cx)
+                        .detach_and_log_err(cx);
+                }
+            }
             BufferEvent::FileHandleChanged => {
                 self.buffer_changed_file(buffer, cx);
             }
